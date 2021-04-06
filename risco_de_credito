@@ -1,0 +1,293 @@
+# Importando pacotes e bibliotecas
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from mpl_toolkits.basemap import Basemap
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import cross_validate
+from xgboost import XGBClassifier
+from imblearn.under_sampling import RandomUnderSampler
+from imblearn.over_sampling import RandomOverSampler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.model_selection import GridSearchCV
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import classification_report
+from sklearn.metrics import roc_auc_score
+from sklearn.utils import resample
+from sklearn.metrics import confusion_matrix
+
+# Configurando o notebook
+sns.set()
+%matplotlib inline
+
+# Lendo os dados
+credito = pd.read_csv('http://dl.dropboxusercontent.com/s/xn2a4kzf0zer0xu/acquisition_train.csv?dl=0')
+credito.head()
+
+(credito.isnull().sum() / credito.shape[0] * 100).sort_values(ascending=False)
+
+fig, ax = plt.subplots()
+sns.countplot('target_default', data=credito, ax=ax)
+ax.set_title("Inadimplentes")
+ax.set_xlabel("Valor")
+ax.set_ylabel("Contagem")
+plt.show()
+
+print("Proporção entre Inadimplentes no Dataset:")
+print(credito['target_default'].value_counts() / credito.shape[0])
+
+credito.nunique().sort_values()
+
+### Limpeza
+Farei a limpeza de dados com apenas um valor único, com quantidades multo altas de valores únicos, descartar variáveis com mais de 50% dos valores ausentes.
+Preencher valores faltantes em 'facebook_profile' com False, considerando que essa pessoa não possui perfil no Facebook.
+Deixar apenas a sigla do estado em 'shipping_state'
+Descartar linhas onde a variável alvo está ausente e transformar os valores desta variável para 0 e 1.
+
+### Valores Ausentes
+Colunas numéricas - Preenchidos com a mediana
+Colunas categóricas - Valores substituidos pelos valores presentes na mesma proporção em que estes aparecem na coluna
+
+# Descartando variáveis
+drop = ['external_data_provider_credit_checks_last_2_year', 'ok_since', 'channel',
+        'target_fraud','ids', 'last_amount_borrowed', 'profile_phone_number', 
+        'reason', 'zip', 'user_agent', 'job_name', 'external_data_provider_first_name',
+        'last_borrowed_in_months', 'state', 'shipping_zip_code']
+
+credito_clean = credito.drop(labels=drop, axis=1)
+        
+#Lidando com valores inf
+credito_clean = credito_clean[credito_clean['reported_income'] != np.inf]
+
+#Lidando com valores negativos
+credito_clean.loc[credito_clean['external_data_provider_email_seen_before'] < 0,
+                 'external_data_provider_email_seen_before'] = np.nan
+        
+#Transformando a coluna facebook_profile
+credito_clean['facebook_profile'].fillna(value=False, inplace=True, axis=0)
+credito_clean['facebook_profile'] = credito_clean['facebook_profile'].map({True: 'Sim', False: 'Não'})
+        
+#Substituindo valores na coluna email
+credito_clean.loc[credito_clean['email'] == 'hotmaill.com', 'email'] = 'hotmail.com'
+credito_clean.loc[credito_clean['email'] == 'gmaill.com', 'email'] = 'gmail.com'
+        
+#Deixando apenas a sigla do estado
+credito_clean['shipping_state'] = credito_clean['shipping_state'].str[-2:]
+        
+#Limpando a variável alvo
+credito_clean.dropna(subset=['target_default'], inplace=True)
+credito_clean['target_default'] = credito_clean['target_default'].map({True: 1, False: 0})
+        
+credito_clean.head()
+
+def preencher_proporcional(col):
+    #Dicionário com valores únicos e porcentagens
+    percentages = col.value_counts(normalize=True).to_dict()
+    
+    #Transformando chaves e valores do dicionário em listas
+    percent = [percentages[key] for key in percentages]
+    labels = [key for key in percentages]
+    
+    #Lista para preenchimento de valores nulos na proporção correta
+    s = pd.Series(np.random.choice(labels, p=percent, size=col.isnull().sum()))
+    col = col.fillna(s)
+    
+    #Verificando se todos foram preenchidos e preenchendo os que não estiverem
+    if len(col.isnull()) > 0:
+        col.fillna(value=max(percentages, key=percentages.get), inplace=True, axis=0)
+        
+    return col
+    
+#Preenchendo valores ausentes
+for col in credito_clean.iloc[:,1:].columns.tolist():
+    if credito_clean[col].dtypes == 'O':
+        credito_clean[col] == preencher_proporcional(credito_clean[col])
+    else:
+        credito_clean[col].fillna(value=credito_clean[col].median(), inplace=True, axis=0)
+        
+credito_clean.isnull().sum()
+
+#Excluindo valores dos minutos e segundos
+credito_clean['application_time_applied'] = credito_clean['application_time_applied'].str[:2].astype(int)
+credito_clean.loc[credito_clean['application_time_applied'] == 24, 'application_time_applied'] = 0
+
+#Transformando a coluna profile_tags
+credito_clean['profile_tags'] = credito_clean['profile_tags'].str.extract('\[(.*)]')
+credito_clean['profile_tags'] = credito_clean['profile_tags'].str.replace("''", "").str.replace(',', '')
+
+credito_clean.head()
+
+fig, ax = plt.subplots(figsize=(40, 8))
+grouped = credito_clean.groupby('shipping_state').target_default.mean().sort_values(ascending=False)
+ax.bar(grouped.index, grouped, color='purple')
+ax.grid(False)
+ax.set_xlabel('')
+ax.set_xticklabels(grouped.index, rotation=45)
+ax.tick_params(colors='white')
+ax.set_title('Impacto de Cada Estado na Inadimplência', fontsize = 30, alpha=0.6)
+
+plt.tight_layout()
+Dois estados se destacam no número de Inadimplência por estado
+
+fig, ax = plt.subplots(figsize=(40, 8))
+grouped = credito_clean.groupby('application_time_applied').target_default.mean().sort_index()
+ax.bar(grouped.index, grouped, color='purple')
+ax.grid(False)
+ax.set_xlabel('')
+ax.set_xticklabels(grouped.index, rotation=45)
+ax.set_xticks(range(0, 25))
+ax.tick_params(colors='white')
+ax.set_title('Impacto de Cada Horário na Inadimplência', fontsize = 30, alpha=0.6)
+
+plt.tight_layout()
+Compras feitas no horários entre meia-noite e 7 horas são os que possuem maior inadimplência
+Por isso irei separar as aplicações feitas de madrugada das outras
+credito_clean['overnight'] = credito_clean['application_time_applied'].apply(lambda x: 1 if x < 6 else 0)
+
+categorical = ['marketing_channel', 'email', 'facebook_profile']
+
+fig = plt.figure(figsize=(40, 8))
+
+for i in range(len(categorical)):
+    to_plot = credito_clean.groupby(categorical[i]).target_default.mean().sort_values()
+    ax = fig.add_subplot(1, 3, i+1)
+    rects = ax.barh(to_plot.index, to_plot, color=sns.color_palette('Set1'), alpha=0.6)
+    ax.grid(False)
+    ax.tick_params(labelleft=True)
+    ax.set_title(f'{categorical[i].title()} vs Inadimplência', alpha=0.5)
+    ax.tick_params(colors='grey')
+    
+    for rect in (rects):
+        width = rect.get_width()
+        ax.text(y=rect.get_y() + rect.get_height() / 2, x=width * 0.5, s=round(width, 2), ha='center', va='center', alpha=0.5, fontweight='bold')
+
+plt.tight_layout()
+plt.show()
+
+numeric = ['risk_rate', 'credit_limit', 'income', 'n_bankruptcies', 'n_accounts',
+ 'n_issues', 'application_time_in_funnel', 'external_data_provider_email_seen_before',
+ 'external_data_provider_fraud_score']
+
+fig = plt.figure(figsize=(25, 16))
+for i in range(len(numeric)):
+    num_plot = credito_clean.groupby(numeric[i]).target_default.mean()
+    ax = fig.add_subplot(3, 3, i+1)
+    ax.scatter(num_plot.index, num_plot)
+    ax.set_title(f'{numeric[i]} vs Inadimplência', alpha = 0.6)
+    ax.tick_params(colors='grey')
+    
+plt.tight_layout()
+plt.savefig('num.png')
+plt.show()
+
+#Criando colunas latitude e longitude
+credito_clean['latitude'] = credito_clean['lat_lon'].str.split(',').str[0].str.replace('(','').astype(float)
+credito_clean['longitude'] = credito_clean['lat_lon'].str.split(',').str[1].str.replace(')', '').astype(float)
+
+#Arredondando os valores
+credito_clean = credito_clean.round({'latitude': 4, 'longitude': 4})
+
+credito_clean.head()
+
+credito_1 = credito_clean[credito_clean['target_default'] == 1]
+
+plt.figure(figsize=(40, 8))
+m = Basemap(projection='cyl', resolution='h', llcrnrlat=-34.5, urcrnrlat=5.57, llcrnrlon=-74.5, urcrnrlon=-33.47)
+
+m.drawmapboundary(fill_color='#85A6D9')
+m.drawcoastlines()
+m.fillcontinents(color='palegoldenrod', lake_color='lightskyblue')
+m.drawstates(color='grey', linewidth=.6)
+m.drawrivers(color='lightskyblue', linewidth=.4)
+m.drawcountries(color='black', linewidth=1.2)
+
+m.scatter(credito_1['longitude'], credito_1['latitude'], s=10, zorder=2, latlon=True, c=credito_1['target_default'], cmap=plt.get_cmap('jet_r'))
+plt.title('Distribuição dos Casos de Inadimplência pelo Brasil')
+plt.savefig('map.png')
+plt.show()
+
+credito_clean.drop(['latitude', 'longitude', 'lat_lon'], axis=1, inplace=True)
+
+fig, ax = plt.subplots(figsize=(20, 8))
+sns.countplot(credito_clean['target_default'])
+plt.show()
+
+credito_clean['target_default'].value_counts()
+
+#Transformando cada conjunto de tags de uma lista
+credito_clean['profile_tags'] = credito_clean['profile_tags'].str.split()
+
+#Criando uma lista com as tags únicas
+tags_unicas = []
+for tags in credito_clean['profile_tags']:
+    for tag in tags:
+        tags_unicas.append(tag)
+        
+tags_unicas = list(set(tags_unicas))
+
+#Criando colunas a partir das tags únicas
+for tag in tags_unicas:
+    credito_clean[tag] = credito_clean['profile_tags'].apply(lambda x: 1 if tag in x else 0)
+
+#Descartando a coluna 'profile_tags'
+credito_clean.drop('profile_tags', axis=1, inplace=True)
+
+credito_clean.head()
+
+cols_encode = ['score_1', 'score_2', 'facebook_profile', 'real_state']
+
+for col in cols_encode:
+    encoder = LabelEncoder().fit(credito_clean[col])
+    credito_clean[col] = encoder.transform(credito_clean[col])
+    
+col_dummies = cols_encode + ['application_time_applied', 'email', 'marketing_channel', 'shipping_state']
+col_dummies.remove('facebook_profile')
+
+credito_clean = pd.get_dummies(credito_clean, columns=col_dummies)
+
+credito_clean.head()
+
+credito_clean.info()
+
+#Dividindo e padronizando o dataset original
+X = credito_clean.drop('target_default', axis=1)
+y = credito_clean['target_default']
+
+X_train, y_train, X_test, y_test = train_test_split(X, y)
+
+scaler = StandardScaler()
+scaler.fit(X_train)
+X_train_unb = scaler.transform(X_train)
+X_test = scaler.transform(X_test)
+
+#Criando o dataset balanceado
+maioria = credito_clean[credito_clean['target_default'] == 0]
+minoria = credito_clean[credito_clean['target_default'] == 1]
+
+minoria_balanceada = resample(minoria, replace=True, n_samples=35025)
+
+credito_balanceado = pd.concat([maioria, minoria_balanceada])
+
+#Dividindo e padronizando o dataset balanceado
+X_balanceado = credito_balanceado.drop('target_default', axis=1)
+y_balanceado = credito_balanceado['target_default']
+
+X_train_balaceado, X_test_balanceado, y_train_balanceado, y_test_balanceado = train_test_split(X_balanceado, y_balanceado)
+
+scaler_balanceado = StandardScaler()
+scaler_balanceado.fit(X_train_balanceado)
+X_train_balanceado = scaler_balanceado.transform(X_train_balanceado)
+X_test_balanceado = scaler_balanceado.transform(X_test_balanceado)
+
+#Verificando o balanceamento
+print(credito_balanceado['target_default'].value_counts(), '\n')
+
+fig, ax = plt.subplots(figsize=(8, 6))
+sns.countplot(credito_balanceado['target_default'])
+ax.set_title('Dados após o balanceamento')
+plt.show()
